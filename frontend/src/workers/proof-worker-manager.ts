@@ -18,6 +18,8 @@ export class ProofWorkerManager {
   }
 
   async init(origin?: string): Promise<void> {
+
+  }
     if (this.isInitialized) {
       logger.warn('Worker already initialized');
       return;
