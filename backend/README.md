@@ -428,51 +428,33 @@ changes: it orphans every previously cached entry instead of silently reusing
 results derived under a different scheme. Keys are digests only — proof
 material is never stored in plaintext or logged.
 
-## Registration Reconciliation Checkpoint
+## Verified Indexer Checkpoint Manifest
 
-`registration_reconcile.py` persists a single checkpoint containing the last
-trusted Stellar ledger, the network name/passphrase identity, and a fingerprint
-of the deployment configuration (`HARPOCRATES_RELEASE_ID`,
-`HARPOCRATES_RELEASE_NETWORK`, and the passphrase). The file is written atomically
-under `HARPOCRATES_REGISTRATION_RECONCILE_DIR` with owner-only permissions.
+The Soroban event indexer (`chain_indexer.py`) binds each persisted checkpoint
+to a canonical, SHA-256-verified manifest (`IndexerCheckpointManifest`) that
+records:
 
-`CheckpointStore.record()` is idempotent for the same ledger and rejects lower
-ledgers. `load()`, `save()`, and `reconcile_registration()` refuse a checkpoint
-whose network or deployment fingerprint differs from the current configuration,
-so a stale or cross-network state file cannot advance confirmed registration
-state. The passphrase defaults to the known value for the configured release
-network; set `STELLAR_NETWORK_PASSPHRASE` explicitly for local or forked
-networks.
+- `manifest_version` (`1`)
+- `indexer_id` (default `soroban_events`)
+- `network` (canonical Stellar network, e.g. `testnet`, `mainnet`, `futurenet`, `standalone`)
+- `contract_id` (registry contract ID)
+- `schema_version` (projection schema version, default `"1"`)
+- `cursor` (Soroban RPC paging cursor)
+- `observed_ledger` (non-negative observed ledger sequence)
+- `manifest_hash` (domain-separated SHA-256 digest of the canonical JSON payload)
 
-```python
-from registration_reconcile import CheckpointStore, DeploymentIdentity
+On resume, `poll_indexer_once()` verifies the manifest digest and checks
+compatibility against the active `network`, `contract_id`, `schema_version`,
+and `observed_ledger` monotonicity before fetching events or mutating
+`proof_events`. Any tampered manifest, target mismatch, or ledger regression
+fails closed with `CheckpointVerificationError` or `IncompatibleCheckpointError`
+without mutating the trusted projection.
 
-deployment = DeploymentIdentity.from_config()
-store = CheckpointStore(deployment=deployment)
-checkpoint = store.record(1_250)
-```
+Optional environment variables:
 
-## Offline Upload Integrity Report
-
-`streaming_upload.py` provides offline integrity inspection for failed upload
-sessions without exposing uploaded media bytes, filesystem paths, or private
-filenames:
-
-- `inspect_failed_upload_session(session_dir, ...)` scans only `chunk-<N>`
-  files in bounded chunks, computing SHA-256 digests and byte counts for each
-  chunk and for the assembled stream.
-- `build_upload_integrity_report(...)` constructs a report directly from
-  session metrics (for example, when admission control rejects a session before
-  any chunks are written).
-- `write_upload_integrity_report(report, destination)` persists the report as
-  canonical JSON.
-
-Each `UploadIntegrityReport` records `expected_bytes`, `observed_bytes`,
-`byte_count_status` (`matched`, `underflow`, `overflow`, `unknown`),
-`expected_digest`, `observed_digest`, `digest_status` (`matched`, `mismatch`,
-`unverified`, `unavailable`), `missing_chunk_indices`, and per-chunk numeric
-summaries. Path-like `session_id` values are rejected (recorded as `null`),
-and non-`chunk-<N>` files in the session directory are ignored.
+- `STELLAR_NETWORK` / `HARPOCRATES_NETWORK`: Explicit network name bound to the checkpoint (inferred from `SOROBAN_RPC_URL` if unset).
+- `INDEXER_SCHEMA_VERSION`: Projection schema version bound to the checkpoint (default `"1"`).
+- `INDEXER_CHECKPOINT_MANIFEST_PATH`: Optional file path for atomic on-disk checkpoint manifest persistence.
 
 ## Test
 
@@ -498,3 +480,10 @@ source videos.
 - Reports aggregate counts (`blob_count`, `total_ref_count`, `total_size_bytes`, `eligible_for_deletion_count`, `retained_count`, `shared_blob_count`), age summaries (`oldest_age_seconds`, `newest_age_seconds`, `average_age_seconds`), and per-blob deletion eligibility (`deletion_eligible`, `deletion_ineligible_reason`).
 - Blobs still referenced by another tenant are marked ineligible (`shared_with_other_tenants`), and blobs younger than `ttl_seconds` (when provided) are marked ineligible (`within_retention_window`).
 - Privacy: other tenants' content hashes, tenant identifiers, encrypted DEKs, and all filesystem `storage_path` values are never queried or returned.
+
+## Evidence Storage Consistency Report
+
+`evidence_storage.generate_consistency_report(storage_dir=None, *, now=None)` returns a read-only consistency report comparing `blobs` metadata, active `tenant_blob_refs` (`ref_count > 0`), and physical files under `storage_dir` (defaulting to `HARPOCRATES_STORAGE_DIR` / `storage.default_storage_dir` without creating or mutating directories):
+
+- Reports `consistent` (`bool`), aggregate `summary` counts, and itemized discrepancies: `missing_files`, `orphaned_blobs`, `orphaned_tenant_refs`, `orphaned_files`, and `size_mismatches`.
+- Strictly read-only: never modifies database rows, never deletes physical files, and never queries or returns `encrypted_dek`.

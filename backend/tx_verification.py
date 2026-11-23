@@ -1,8 +1,7 @@
 """Horizon-backed Stellar transaction status checks for registration reconcile."""
 
 from __future__ import annotations
-from dataclasses import dataclass
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class TxVerificationResult:
@@ -13,6 +12,11 @@ class TxVerificationResult:
     confirmations: int | None = None
     successful: bool | None = None
     source: str | None = None
+    # Freshness/coverage metadata so read views can distinguish a stale
+    # index from an invalid on-chain proof.
+    last_trusted_ledger: int | None = None
+    known_gaps: list[tuple[int, int]] = field(default_factory=list)
+    index_stale: bool = False
 
 
 class NetworkMismatchError(ValueError):
@@ -60,12 +64,27 @@ TERMINAL_STATUSES = frozenset({"confirmed", "failed", "missing"})
 ALLOWED_STATUSES = frozenset({"pending", "confirmed", "failed", "missing", "error"})
 NETWORK_MISMATCH_REASON = "network_passphrase_mismatch"
 
+# Maximum ledger lag tolerated before a read index is considered stale.
+# Override with HORIZON_MAX_INDEX_LAG_LEDGERS.
+_DEFAULT_MAX_INDEX_LAG_LEDGERS = 20
+
 
 def horizon_urls() -> tuple[str, ...]:
     urls = os.getenv("HORIZON_URLS")
     if urls:
         return tuple(u.strip() for u in urls.split(",") if u.strip())
     return _DEFAULT_RPC_URLS
+
+
+def max_index_lag_ledgers() -> int:
+    raw = os.getenv("HORIZON_MAX_INDEX_LAG_LEDGERS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_INDEX_LAG_LEDGERS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_INDEX_LAG_LEDGERS
+    return value if value >= 0 else _DEFAULT_MAX_INDEX_LAG_LEDGERS
 
 
 def _short_hash(tx_hash: str) -> str:
@@ -88,22 +107,71 @@ def _latest_ledger(rpc_url: str, timeout: float = 10.0) -> int | None:
     return None
 
 
-def _check_network_binding(data: dict, expected_passphrase: str | None) -> None:
-    """Fail closed with a specific reason when the tx is bound to another network.
-
-    Wrong-network evidence is kept distinct from malformed proof data: a
-    mismatched passphrase raises NetworkMismatchError, while a missing or
-    non-string passphrase is treated as malformed and raises ValueError.
+def index_freshness(
+    *,
+    indexed_ledger: int | None,
+    latest_ledger: int | None,
+    known_gaps: list[tuple[int, int]] | None = None,
+    max_lag: int | None = None,
+) -> dict:
     """
-    if expected_passphrase is None:
-        return
-    actual = data.get("network_passphrase")
-    if not isinstance(actual, str) or not actual:
-        raise ValueError("malformed_network_passphrase")
-    if actual != expected_passphrase:
-        raise NetworkMismatchError(
-            f"{NETWORK_MISMATCH_REASON}: expected={expected_passphrase!r} actual={actual!r}"
-        )
+    Describe how fresh and complete the read index is.
+
+    ``last_trusted_ledger`` is the highest ledger the index has fully covered
+    with no gaps below it. ``index_stale`` is True when the index lags the
+    chain tip beyond ``max_lag``, or when the lag cannot be determined. Stale
+    indexes must never be read as evidence that a proof is invalid.
+    """
+    gaps = sorted(known_gaps or [])
+    lag_limit = max_index_lag_ledgers() if max_lag is None else max_lag
+
+    last_trusted: int | None = None
+    if indexed_ledger is not None:
+        last_trusted = indexed_ledger
+        for start, end in gaps:
+            if start <= last_trusted:
+                last_trusted = start - 1 if start - 1 >= 0 else None
+                break
+
+    if indexed_ledger is None or latest_ledger is None:
+        stale = True
+        lag = None
+    else:
+        lag = max(0, latest_ledger - indexed_ledger)
+        stale = lag > lag_limit
+
+    return {
+        "last_trusted_ledger": last_trusted,
+        "indexed_ledger": indexed_ledger,
+        "latest_ledger": latest_ledger,
+        "lag_ledgers": lag,
+        "known_gaps": [list(g) for g in gaps],
+        "index_stale": stale,
+    }
+
+
+def annotate_with_freshness(
+    result: TxVerificationResult,
+    *,
+    indexed_ledger: int | None,
+    known_gaps: list[tuple[int, int]] | None = None,
+) -> TxVerificationResult:
+    """
+    Attach freshness/coverage to a verification result.
+
+    Staleness is reported only; it never changes ``status``. A stale index
+    must not turn a confirmed proof into a failed or invalid one, and a
+    transaction at or below the last trusted ledger is unaffected by lag.
+    """
+    info = index_freshness(
+        indexed_ledger=indexed_ledger,
+        latest_ledger=result.latest_ledger,
+        known_gaps=known_gaps,
+    )
+    result.last_trusted_ledger = info["last_trusted_ledger"]
+    result.known_gaps = [tuple(g) for g in info["known_gaps"]]
+    result.index_stale = info["index_stale"]
+    return result
 
 
 @traced(

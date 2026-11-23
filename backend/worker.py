@@ -21,6 +21,8 @@ from db import (
     report_job_progress,
     complete_job,
     fail_job,
+    mark_job_cancelled,
+    is_job_cancelled,
     insert_proof_event,
     init_db,
     database_url,
@@ -28,7 +30,7 @@ from db import (
     update_tx_status,
 )
 from envelope import canonical_metadata_hash
-from stego import StegoLimitExceededError, embed_metadata, extract_metadata, sha256_file
+from stego import embed_metadata, extract_metadata, sha256_file
 from noir import generate_silent_witness
 from app import safe_filename, redact_metadata
 from app import normalize_filename, redact_metadata
@@ -49,41 +51,9 @@ LOGGER.setLevel(logging.INFO)
 
 WORKER_ID = f"worker-{os.getpid()}"
 
-DIAGNOSTIC_MAX_BYTES = 2048
-DIAGNOSTIC_MAX_FRAMES = 20
 
-_PRIVATE_PATH_RE = re.compile(r"(?:/(?:home|Users|root|var|tmp|srv|opt|mnt)/[^\s'\"]*)")
-_SECRET_RE = re.compile(
-    r"(?i)((?:secret|token|password|passwd|api[_-]?key|authorization|credential)[\w-]*\s*[=:]\s*)(\S+)"
-)
-_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
-
-
-def _redact_diagnostic_text(text: str) -> str:
-    text = _SECRET_RE.sub(r"\1[REDACTED]", text)
-    text = _PRIVATE_PATH_RE.sub("[PATH]", text)
-    text = _LONG_TOKEN_RE.sub("[REDACTED]", text)
-    return text
-
-
-def _cap_bytes(text: str, limit: int = DIAGNOSTIC_MAX_BYTES) -> str:
-    encoded = text.encode("utf-8", errors="replace")
-    if len(encoded) <= limit:
-        return text
-    return encoded[:limit].decode("utf-8", errors="ignore") + "...[truncated]"
-
-
-def sanitize_exception_text(err: BaseException) -> str:
-    """Return bounded, redacted text describing an exception."""
-    return _cap_bytes(_redact_diagnostic_text(str(err)))
-
-
-def sanitize_traceback(err: BaseException) -> str:
-    """Return bounded, redacted traceback text; frames are capped and redacted."""
-    frames = traceback.format_exception(type(err), err, err.__traceback__)
-    frames = frames[-DIAGNOSTIC_MAX_FRAMES:]
-    text = "".join(frames)
-    return _cap_bytes(_redact_diagnostic_text(text))
+class JobCancelledError(Exception):
+    """Raised when a job is intentionally cancelled during worker execution."""
 
 @traced_job("job.media.embed")
 def process_embed(job: dict) -> dict:
@@ -98,20 +68,20 @@ def process_embed(job: dict) -> dict:
     if not input_path.exists():
         raise RuntimeError(f"Input video file missing for job {job_id}")
         
-    report_job_progress(job_id, "hashing_source")
+    report_job_progress(job_id, "hashing_source", stage_revision=1)
     source_hash = sha256_file(input_path)
 
     def on_frame(frames_done: int, frames_total: int | None) -> None:
         percent = (frames_done / frames_total * 100.0) if frames_total else None
-        report_job_progress(job_id, "embedding", percent)
+        report_job_progress(job_id, "embedding", percent, stage_revision=2)
 
     embed_metadata(input_path, output_path, metadata, progress_callback=on_frame)
 
-    report_job_progress(job_id, "hashing_output")
+    report_job_progress(job_id, "hashing_output", stage_revision=3)
     embedded_hash = sha256_file(output_path)
     metadata_hash = canonical_metadata_hash(metadata)
 
-    report_job_progress(job_id, "recording")
+    report_job_progress(job_id, "recording", stage_revision=4)
     db_event = insert_proof_event(
         event_type="embed",
         file_name=normalize_filename(filename),
@@ -174,7 +144,9 @@ def process_silent_witness(job: dict) -> dict:
     credential_secret = payload["credential_secret"]
     nullifier_secret = payload["nullifier_secret"]
 
-    report_job_progress(job["id"], "generating_proof")
+    # Phase names only: proof generation runs as one external command and
+    # reports no measurable fraction, so percent stays None.
+    report_job_progress(job["id"], "generating_proof", stage_revision=1)
     proof = generate_silent_witness(
         video_hash,
         credential_secret,
@@ -326,7 +298,7 @@ def run_worker(
     indexer_thread.daemon = True
     indexer_thread.start()
 
-    last_sweep_time = time.time()
+    last_sweep_time = 0.0
     while not stop_event.is_set():
         try:
             now_time = time.time()
@@ -388,18 +360,30 @@ def run_worker(
                         res = process_verify_tx(job)
                     else:
                         raise ValueError(f"Unknown job type {job_type}")
-                    if not deadline_exceeded.is_set():
+                    if is_job_cancelled(job_id):
+                        LOGGER.info(
+                            f"Job {job_id} was cancelled before completion; preserving cancelled state"
+                        )
+                        mark_job_cancelled(job_id)
+                    else:
                         complete_job(job_id, res)
                         LOGGER.info(f"Completed job {job_id}")
+                except JobCancelledError as err:
+                    LOGGER.info(f"Cancelled job {job_id}: {err}")
+                    mark_job_cancelled(job_id, reason=str(err) or None)
                 except Exception as err:
-                    if not deadline_exceeded.is_set():
-                        safe_message = sanitize_exception_text(err)
-                        LOGGER.error(f"Failed job {job_id}: {safe_message}")
-                        LOGGER.error(sanitize_traceback(err))
-                        is_fatal = isinstance(err, ValueError) and job_type != "verify_tx"
-                        if job_type == "verify_tx":
-                            is_fatal = isinstance(err, ValueError)
-                        fail_job(job_id, safe_message, is_fatal=is_fatal)
+                    if is_job_cancelled(job_id):
+                        LOGGER.info(
+                            f"Ignoring error for already-cancelled job {job_id}: {err}"
+                        )
+                        mark_job_cancelled(job_id)
+                        return
+                    LOGGER.error(f"Failed job {job_id}: {err}")
+                    LOGGER.error(traceback.format_exc())
+                    is_fatal = isinstance(err, ValueError) and job_type != "verify_tx"
+                    if job_type == "verify_tx":
+                        is_fatal = isinstance(err, ValueError)
+                    fail_job(job_id, str(err), is_fatal=is_fatal)
                 finally:
                     hb_stop_event.set()
                     hb_thread.join()
@@ -429,7 +413,7 @@ def run_worker(
                             "cryptographic_failure": False,
                         },
                     )
-                    fail_job(job_id, "Processing deadline exceeded", is_fatal=True)
+                    fail_job(job_id, "Processing deadline exceeded", is_fatal=True, reason=DEADLINE_EXCEEDED_REASON)
                     break
                 if stop_event.is_set() and work_thread.is_alive():
                     work_thread.join(timeout=grace_period_seconds)
@@ -438,7 +422,12 @@ def run_worker(
                             f"Job {job_id} did not finish within grace period of {grace_period_seconds}s; releasing job"
                         )
                         hb_stop_event.set()
-                        fail_job(job_id, "Worker shutdown grace period exceeded", is_fatal=False)
+                        fail_job(
+                            job_id,
+                            "Worker shutdown grace period exceeded",
+                            is_fatal=False,
+                            reason="shutdown_grace_exceeded",
+                        )
                     break
 
         except Exception as e:
