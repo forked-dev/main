@@ -12,26 +12,6 @@ from register_auth import ScopedKey, parse_scoped_keys
 @dataclass(frozen=True)
 class AppConfig:
     app_env: str
-
-    def redacted_summary(self) -> dict[str, Any]:
-        """Return a dict representation of the config where secret fields are redacted.
-        Secret fields (API keys, endpoints, tokens) are replaced with a boolean indicating
-        presence (True if set, False otherwise). Non‑secret fields retain their original
-        values.
-        """
-        from dataclasses import asdict
-        secret_fields = {
-            "metrics_token",
-            "tracing_endpoint",
-            "register_api_key",
-            "register_api_key_previous",
-        }
-        raw = asdict(self)
-        for field in secret_fields:
-            if field in raw:
-                raw[field] = raw[field] is not None
-        return raw
-
     cors_origins: list[str]
     max_content_length: int
     max_video_bytes: int
@@ -88,13 +68,35 @@ class AppConfig:
     retention_blob_gc_enabled: bool = False
     retention_unreferenced_blobs_enabled: bool = False
     retention_dry_run: bool = False
-    # None falls back to MAX_VIDEO_BYTES; zero allows no file payload.
-    upload_max_bytes: int | None = None
-    # Per-tenant temporary upload storage budget in bytes (None = unlimited).
-    # This limits the total temporary disk space a single tenant can reserve
-    # for in-flight uploads.
-    upload_temp_budget_bytes: int | None = None
+    # Two-phase deletion receipts for retained evidence (audit trail only;
+    # never stores media bytes or plaintext keys).
+    deletion_receipts_enabled: bool = False
+    deletion_receipt_salt: str | None = None
+    deletion_receipt_ttl_seconds: int = 2_592_000
+    registration_reconcile_state_dir: str = ""
+    stellar_network_passphrase: str = ""
 
+    def redacted_summary(self) -> dict[str, object]:
+        """Return a dict representation of the config where secret fields are redacted.
+
+        Secret fields (API keys, endpoints, tokens) are replaced with a boolean indicating
+        presence (True if set, False otherwise). Non-secret fields retain their original
+        values.
+        """
+        from dataclasses import asdict
+
+        secret_fields = {
+            "metrics_token",
+            "tracing_endpoint",
+            "register_api_key",
+            "register_api_key_previous",
+            "deletion_receipt_salt",
+        }
+        raw = asdict(self)
+        for field in secret_fields:
+            if field in raw:
+                raw[field] = raw[field] is not None
+        return raw
 
 
 def load_config() -> AppConfig:
@@ -116,6 +118,11 @@ def load_config() -> AppConfig:
         raise RuntimeError(
             "REGISTER_API_KEY_PREVIOUS is required when REGISTER_API_KEY_PREVIOUS_EXPIRES is set"
         )
+
+    deletion_receipts_enabled = _bool_env("HARPOCRATES_DELETION_RECEIPTS_ENABLED", False)
+    deletion_receipt_salt = _str_env("DELETION_RECEIPT_SALT")
+    if deletion_receipts_enabled and deletion_receipt_salt is None:
+        raise RuntimeError("DELETION_RECEIPT_SALT is required when deletion receipts are enabled")
 
     return AppConfig(
         app_env=app_env,
@@ -174,10 +181,16 @@ def load_config() -> AppConfig:
         retention_blob_gc_enabled=_blob_gc_enabled_env(),
         retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
         retention_dry_run=_bool_env("HARPOCRATES_RETENTION_DRY_RUN", False),
-        upload_max_bytes=_optional_nonnegative_int_env("UPLOAD_MAX_BYTES"),
-        upload_temp_budget_bytes=_optional_nonnegative_int_env("UPLOAD_TEMP_BUDGET_BYTES"),
+        deletion_receipts_enabled=deletion_receipts_enabled,
+        deletion_receipt_salt=deletion_receipt_salt,
+        deletion_receipt_ttl_seconds=_int_env("DELETION_RECEIPT_TTL_SECONDS", 2_592_000),
+        registration_reconcile_state_dir=_str_env("HARPOCRATES_REGISTRATION_RECONCILE_DIR") or "",
+        stellar_network_passphrase=(
+            _str_env("STELLAR_NETWORK_PASSPHRASE")
+            or _str_env("HARPOCRATES_NETWORK_PASSPHRASE")
+            or ""
+        ),
     )
-
 
 
 def _upload_chunk_bytes() -> int:
@@ -265,20 +278,8 @@ def _datetime_env(name: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
+        raise RuntimeError(f"{name} must be an ISO-8601 datetime") from except ValueError as exc:
         raise RuntimeError(f"{name} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
-        raise RuntimeError(f"{name} must include a timezone")
-    return parsed.astimezone(timezone.utc)
-
-
-def _float_env(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    parsed = float(value)
-    if parsed <= 0.0:
-        raise RuntimeError(f"{name} must be positive")
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
-
-
-def _s

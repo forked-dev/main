@@ -29,6 +29,14 @@ Stellar.
 `POST /api/stego/extract` reads the embedded artifact, hashes the received file,
 and returns extracted Harpocrates metadata when present.
 
+## Receipt Signing-Key History
+
+`GET /api/receipts/signing-keys` returns the public receipt signing-key history
+as a bounded, read-only list. Each entry carries the public key, its
+`valid_from` and `valid_until` validity interval, and a key identifier. The
+endpoint never exposes or loads private signing material; signing remains
+owned by the frontend.
+
 
 ## Configuration
 
@@ -428,13 +436,11 @@ changes: it orphans every previously cached entry instead of silently reusing
 results derived under a different scheme. Keys are digests only — proof
 material is never stored in plaintext or logged.
 
-## Registration Reconciliation Checkpoint
+## Storage Quota Exhaustion vs. Evidence Corruption
 
-`registration_reconcile.py` persists a single checkpoint containing the last
-trusted Stellar ledger, the network name/passphrase identity, and a fingerprint
-of the deployment configuration (`HARPOCRATES_RELEASE_ID`,
-`HARPOCRATES_RELEASE_NETWORK`, and the passphrase). The file is written atomically
-under `HARPOCRATES_REGISTRATION_RECONCILE_DIR` with owner-only permissions.
+`storage.py`, `evidence_storage.py`, and `errors.py` separate operational disk
+capacity limits from cryptographic or digest corruption using stable machine
+reason codes:
 
 `CheckpointStore.record()` is idempotent for the same ledger and rejects lower
 ledgers. `load()`, `save()`, and `reconcile_registration()` refuse a checkpoint
@@ -452,27 +458,45 @@ store = CheckpointStore(deployment=deployment)
 checkpoint = store.record(1_250)
 ```
 
-## Offline Upload Integrity Report
+## Resumable Evidence Integrity Verification
 
-`streaming_upload.py` provides offline integrity inspection for failed upload
-sessions without exposing uploaded media bytes, filesystem paths, or private
-filenames:
+`evidence_storage.py` provides bounded, resumable integrity verification across
+stored encrypted evidence blobs (`verify_evidence_batch()` and
+`verify_evidence_resumable()`):
 
-- `inspect_failed_upload_session(session_dir, ...)` scans only `chunk-<N>`
-  files in bounded chunks, computing SHA-256 digests and byte counts for each
-  chunk and for the assembled stream.
-- `build_upload_integrity_report(...)` constructs a report directly from
-  session metrics (for example, when admission control rejects a session before
-  any chunks are written).
-- `write_upload_integrity_report(report, destination)` persists the report as
-  canonical JSON.
+- Blobs are scanned in deterministic `content_hash` order in bounded batches
+  (`DEFAULT_VERIFY_BATCH_SIZE=50`, clamped to `MAX_VERIFY_BATCH_SIZE=500`).
+- Each blob's metadata (`content_hash`, `size_bytes`, `storage_path`) and
+  Fernet ciphertext are verified. Unverifiable legacy blobs (e.g. missing or
+  `legacy:`-prefixed DEK, unreadable legacy master key, non-SHA-256 legacy
+  hash, or missing `size_bytes`) are counted separately under
+  `unverifiable_legacy` rather than conflated with ciphertext/metadata
+  corruption (`failed`).
+- Resumable progress is written atomically to
+  `storage.get_integrity_progress_path()` under `HARPOCRATES_STORAGE_DIR`
+  (default `/tmp/harpocrates_jobs/evidence_integrity_progress.json`).
+- Persisted progress records only nonsecret metadata (`schema_version`,
+  `run_id`, `status`, `cursor`, `batch_size`, `batches_completed`, `totals`,
+  `failure_reasons`, `legacy_reasons`, `updated_at`) — never plaintext,
+  ciphertext, DEKs, master keys, or filesystem paths.
 
-Each `UploadIntegrityReport` records `expected_bytes`, `observed_bytes`,
-`byte_count_status` (`matched`, `underflow`, `overflow`, `unknown`),
-`expected_digest`, `observed_digest`, `digest_status` (`matched`, `mismatch`,
-`unverified`, `unavailable`), `missing_chunk_indices`, and per-chunk numeric
-summaries. Path-like `session_id` values are rejected (recorded as `null`),
-and non-`chunk-<N>` files in the session directory are ignored.
+## Encryption Envelope Versions
+
+`evidence_storage.py` records an explicit `envelope_version` column on `blobs`
+(default `fernet-v1`, added in migration 13):
+
+- `classify_envelope_version()` distinguishes supported versions (`fernet-v1`),
+  known legacy envelopes (`None` for pre-versioning rows, `legacy-v0`,
+  `fernet-v0`), and unsupported formats (any unrecognized, empty, or non-string
+  identifier).
+- `record_blob()` validates and stores `envelope_version`, rejecting known
+  legacy or unsupported values on write.
+- `decrypt_blob_ciphertext()` and `verify_blob_integrity()` dispatch strictly
+  on the recorded `envelope_version` and never guess a decryption algorithm
+  from malformed ciphertext. Known legacy versions are reported as
+  `unverifiable_legacy` (`legacy_envelope_version`), while unsupported formats
+  fail closed (`unsupported_envelope_version`). Pre-versioning rows with
+  `envelope_version IS NULL` remain compatible with Fernet.
 
 ## Test
 
@@ -498,3 +522,10 @@ source videos.
 - Reports aggregate counts (`blob_count`, `total_ref_count`, `total_size_bytes`, `eligible_for_deletion_count`, `retained_count`, `shared_blob_count`), age summaries (`oldest_age_seconds`, `newest_age_seconds`, `average_age_seconds`), and per-blob deletion eligibility (`deletion_eligible`, `deletion_ineligible_reason`).
 - Blobs still referenced by another tenant are marked ineligible (`shared_with_other_tenants`), and blobs younger than `ttl_seconds` (when provided) are marked ineligible (`within_retention_window`).
 - Privacy: other tenants' content hashes, tenant identifiers, encrypted DEKs, and all filesystem `storage_path` values are never queried or returned.
+
+## Evidence Storage Consistency Report
+
+`evidence_storage.generate_consistency_report(storage_dir=None, *, now=None)` returns a read-only consistency report comparing `blobs` metadata, active `tenant_blob_refs` (`ref_count > 0`), and physical files under `storage_dir` (defaulting to `HARPOCRATES_STORAGE_DIR` / `storage.default_storage_dir` without creating or mutating directories):
+
+- Reports `consistent` (`bool`), aggregate `summary` counts, and itemized discrepancies: `missing_files`, `orphaned_blobs`, `orphaned_tenant_refs`, `orphaned_files`, and `size_mismatches`.
+- Strictly read-only: never modifies database rows, never deletes physical files, and never queries or returns `encrypted_dek`.
