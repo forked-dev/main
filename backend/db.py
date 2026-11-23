@@ -8,7 +8,7 @@ import re
 import os
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import psycopg
@@ -1198,6 +1198,62 @@ def purge_expired_events(batch_size: int = RETENTION_BATCH_DEFAULT_SIZE) -> list
 
 
 _JOBS: dict[int, dict[str, Any]] = {}
+
+# Bounded per-job attempt history (see docs/job-status.md). Each lease opens an
+# attempt; progress and the terminal outcome are recorded on it. Only the
+# newest JOB_ATTEMPT_HISTORY_LIMIT attempts are kept; ``attempt`` keeps
+# counting, so dropped attempts show up as a gap in the numbering.
+JOB_ATTEMPT_HISTORY_LIMIT = 10
+# Outcomes recorded on an attempt.
+ATTEMPT_COMPLETED = "completed"
+ATTEMPT_FAILED = "failed"
+ATTEMPT_RELEASED = "released"
+# Attempt history is public, so free text (error messages may quote paths or
+# payload values) is never stored. Values that are not a plain code are
+# dropped entirely rather than cleaned, so nothing derived from them leaks.
+_ATTEMPT_REASON_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_ATTEMPT_WORKER_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _attempt_code(value: Any, pattern: re.Pattern[str] = _ATTEMPT_REASON_RE) -> str | None:
+    """Return ``value`` if it is a plain code (e.g. an exception class name), else None."""
+    if isinstance(value, str) and pattern.fullmatch(value):
+        return value
+    return None
+
+
+def _open_attempt(job: dict[str, Any], worker_id: str) -> None:
+    attempts = job.setdefault("attempts", [])
+    number = job.get("_attempt_count", 0) + 1
+    job["_attempt_count"] = number
+    attempts.append(
+        {
+            "attempt": number,
+            "worker_id": _attempt_code(worker_id, _ATTEMPT_WORKER_RE),
+            "leased_at": datetime.now(UTC).isoformat(),
+            "ended_at": None,
+            "outcome": None,
+            "reason": None,
+            "progress": None,
+        }
+    )
+    del attempts[:-JOB_ATTEMPT_HISTORY_LIMIT]
+
+
+def _current_attempt(job: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = job.get("attempts") or []
+    if attempts and attempts[-1].get("outcome") is None:
+        return attempts[-1]
+    return None
+
+
+def _close_attempt(job: dict[str, Any], outcome: str, reason: Any = None) -> None:
+    attempt = _current_attempt(job)
+    if attempt is None:
+        return
+    attempt["outcome"] = outcome
+    attempt["reason"] = _attempt_code(reason)
+    attempt["ended_at"] = datetime.now(UTC).isoformat()
 _next_job_id = 1
 _TENANT_LAST_LEASED_SEQ: dict[str, int] = {}
 _lease_seq = 0
@@ -1209,96 +1265,21 @@ DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT = 10
 DEADLINE_EXCEEDED_REASON = "processing_deadline_exceeded"
 
 
-class TenantQueueLimitExceededError(Exception):
-    """Raised when a tenant exceeds the per-tenant queued video job bound."""
-
-    def __init__(
-        self,
-        *,
-        tenant_id: str,
-        limit: int,
-        queued_count: int,
-        job_type: str,
-    ) -> None:
-        super().__init__(
-            f"tenant '{tenant_id}' exceeded queued {job_type} job limit ({queued_count}/{limit})"
-        )
-        self.tenant_id = tenant_id
-        self.limit = limit
-        self.queued_count = queued_count
-        self.job_type = job_type
+DEFAULT_CANCELLATION_REASON = "Job cancelled"
 
 
-def max_concurrent_video_jobs_per_tenant() -> int:
-    """Maximum concurrent expensive video jobs allowed per tenant."""
-    return _positive_int_env(
-        "WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT",
-        DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT,
+def _cancelled_result(reason: str | None = None) -> dict[str, Any]:
+    """Build the stable cancelled result payload returned to requesters."""
+    text = (
+        reason.strip()
+        if isinstance(reason, str) and reason.strip()
+        else DEFAULT_CANCELLATION_REASON
     )
+    return {"cancelled": True, "reason": text}
 
 
-def max_queued_video_jobs_per_tenant() -> int:
-    """Maximum queued (pending) expensive video jobs allowed per tenant."""
-    return _positive_int_env(
-        "WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT",
-        DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT,
-    )
-
-
-def _resolve_tenant_id(tenant_id: str | None, payload: dict[str, Any] | None) -> str:
-    raw = tenant_id
-    if raw is None and isinstance(payload, dict):
-        raw = payload.get("tenant_id")
-    if raw is None:
-        return DEFAULT_TENANT_ID
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("tenant_id must be a non-empty string")
-    return raw.strip()
-
-
-def count_tenant_video_jobs(tenant_id: str, *, status: str) -> int:
-    """Count expensive video jobs for *tenant_id* currently in *status*."""
-    return sum(
-        1
-        for job in _JOBS.values()
-        if job.get("status") == status
-        and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES
-        and job.get("tenant_id", DEFAULT_TENANT_ID) == tenant_id
-    )
-
-
-def get_tenant_video_job_counts() -> dict[str, dict[str, int]]:
-    """Return per-tenant pending and running counts for expensive video jobs."""
-    counts: dict[str, dict[str, int]] = {}
-    for job in _JOBS.values():
-        if job.get("type") not in EXPENSIVE_VIDEO_JOB_TYPES:
-            continue
-        status = job.get("status")
-        if status not in ("pending", "running"):
-            continue
-        tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
-        bucket = counts.setdefault(tenant, {"pending": 0, "running": 0})
-        bucket[status] += 1
-    return counts
-
-
-def enqueue_job(
-    job_type: str,
-    payload: dict[str, Any],
-    *,
-    tenant_id: str | None = None,
-    max_queued_per_tenant: int | None = None,
-    deadline_at: datetime | None = None,
-    deadline_seconds: float | None = None,
-    now: datetime | None = None,
-) -> int:
-    """Enqueue a background job and return its job id.
-
-    Expensive video jobs (``embed``, ``extract``) are bounded per tenant via
-    ``max_queued_per_tenant`` (or ``WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT``).
-    Optional ``deadline_at`` / ``deadline_seconds`` preserve an independent
-    processing deadline on the job record.
-    """
+def enqueue_job(job_type: str, payload: dict[str, Any]) -> int:
+    """Enqueue a background job and return its job id."""
     global _next_job_id
     resolved_tenant = _resolve_tenant_id(tenant_id, payload)
 
@@ -1347,7 +1328,8 @@ def enqueue_job(
         "status": "pending",
         "result": None,
         "progress": None,
-        "created_at": current.isoformat(),
+        "retry_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if resolved_deadline is not None:
         record["deadline_at"] = resolved_deadline.isoformat()
@@ -1360,30 +1342,50 @@ def get_job(job_id: int) -> dict[str, Any] | None:
     return _JOBS.get(job_id)
 
 
-def cancel_job(job_id: int) -> bool:
-    """Cancel a pending job. Returns True on success."""
+def cancel_job(job_id: int, *, reason: str | None = None) -> bool:
+    """Cancel a pending or running job without affecting failure retry counts.
+
+    Preserves a stable cancelled result for the requester and records
+    ``cancelled_at``. Returns True when the job transitioned to ``cancelled``,
+    False when the job does not exist or is already in a terminal state.
+    """
     job = _JOBS.get(job_id)
-    if job and job["status"] == "pending":
+    if job and job.get("status") in ("pending", "running"):
         job["status"] = "cancelled"
+        job["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+        job["result"] = _cancelled_result(reason)
+        job.pop("worker_id", None)
         return True
     return False
 
 
-DEFAULT_HEARTBEAT_STALE_SECONDS = 300.0
-STALE_HEARTBEAT_REASON = "stale_worker_heartbeat"
-PROCESSING_STATE_CATEGORY = "processing_state"
+def mark_job_cancelled(job_id: int, reason: str | None = None) -> bool:
+    """Record intentional worker cancellation for a job.
+
+    Unlike :func:`fail_job`, cancellation never increments ``retry_count``,
+    never re-queues the job for automatic retry, and never sets failure fields
+    (``error`` / ``failed_at``). If the job is already ``cancelled``, its
+    existing ``cancelled_at`` and ``result`` are preserved unchanged.
+    """
+    job = _JOBS.get(job_id)
+    if not job:
+        return False
+    status = job.get("status")
+    if status == "cancelled":
+        if not isinstance(job.get("result"), dict) or job["result"].get("cancelled") is not True:
+            job["result"] = _cancelled_result(reason)
+        job.setdefault("cancelled_at", datetime.now(timezone.utc).isoformat())
+        job.pop("worker_id", None)
+        return True
+    if status in ("pending", "running"):
+        return cancel_job(job_id, reason=reason)
+    return False
 
 
-def _parse_iso_utc(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+def is_job_cancelled(job_id: int) -> bool:
+    """Return True when the job exists and is in the ``cancelled`` state."""
+    job = _JOBS.get(job_id)
+    return bool(job and job.get("status") == "cancelled")
 
 
 def lease_job(
@@ -1480,10 +1482,13 @@ def lease_job(
     chosen["heartbeat_at"] = current_iso
     chosen["lease_duration_seconds"] = lease_seconds
     chosen.pop("processing_state", None)
+    _open_attempt(chosen, worker_id)
     if chosen.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
         _lease_seq += 1
         _TENANT_LAST_LEASED_SEQ[chosen.get("tenant_id", DEFAULT_TENANT_ID)] = _lease_seq
-    return dict(chosen)
+    leased = dict(chosen)
+    leased["attempts"] = [dict(attempt) for attempt in chosen["attempts"]]
+    return leased
 
 
 def heartbeat_job(
@@ -1605,6 +1610,7 @@ def reclaim_stale_jobs(
         )
         if not state["stale"]:
             continue
+        _close_attempt(job, ATTEMPT_RELEASED, STALE_HEARTBEAT_REASON)
         job["status"] = "pending"
         job.pop("worker_id", None)
         job["processing_state"] = {
@@ -1631,6 +1637,7 @@ def reclaim_stale_jobs(
 # once per decoded frame); updates are stored at most once per this interval.
 JOB_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 JOB_PROGRESS_PHASE_MAX_LENGTH = 64
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 def report_job_progress(
@@ -1638,15 +1645,18 @@ def report_job_progress(
     phase: str,
     percent: float | None = None,
     *,
+    stage_revision: int | None = None,
     now: float | None = None,
 ) -> bool:
     """Record ``{"phase", "percent"}`` progress for a running job.
 
     ``phase`` is a short machine-readable step name (for example
     ``"embedding"``); ``percent`` is 0-100 or ``None`` when the step has no
-    measurable fraction. Updates are throttled to at most one per
-    ``JOB_PROGRESS_MIN_INTERVAL_SECONDS`` per job, and only running jobs are
-    updated. Returns True when the update was stored.
+    measurable fraction. When ``stage_revision`` is supplied, it must be a
+    non-negative integer and is enforced monotonically so late updates from a
+    completed stage are rejected regardless of wall-clock ordering. Updates are
+    throttled to at most one per ``JOB_PROGRESS_MIN_INTERVAL_SECONDS`` per job,
+    and only running jobs are updated. Returns True when the update was stored.
     """
     job = _JOBS.get(job_id)
     if not job or job.get("status") != "running":
@@ -1662,37 +1672,57 @@ def report_job_progress(
         if percent != percent:  # NaN
             raise ValueError("progress percent must be a number or None")
         percent = round(min(100.0, max(0.0, percent)), 1)
+    if stage_revision is not None:
+        if isinstance(stage_revision, bool) or not isinstance(stage_revision, int) or stage_revision < 0:
+            raise ValueError("progress stage_revision must be a non-negative integer")
+        current_revision = job.get("_stage_revision")
+        if current_revision is not None and stage_revision < current_revision:
+            return False
+        if current_revision is None or stage_revision > current_revision:
+            job["_stage_revision"] = stage_revision
     current = time.monotonic() if now is None else now
     last = job.get("_progress_at")
     if last is not None and current - last < JOB_PROGRESS_MIN_INTERVAL_SECONDS:
         return False
     job["_progress_at"] = current
     job["progress"] = {"phase": phase, "percent": percent}
+    attempt = _current_attempt(job)
+    if attempt is not None:
+        attempt["progress"] = {"phase": phase, "percent": percent}
     return True
 
 
 def complete_job(job_id: int, result: Any = None) -> None:
-    """Mark an in-memory job completed."""
+    """Mark an in-memory job completed. Terminal jobs are never modified."""
     job = _JOBS.get(job_id)
-    if not job:
+    if not job or job.get("status") in TERMINAL_JOB_STATUSES:
         return
+    _close_attempt(job, ATTEMPT_COMPLETED)
     job["status"] = "completed"
     job["result"] = result
     job["completed_at"] = datetime.now(timezone.utc).isoformat()
 
 
 def fail_job(job_id: int, error: str, *, is_fatal: bool = False) -> None:
-    """Mark an in-memory job failed (fatal) or pending for retry."""
+    """Mark an in-memory job failed (fatal) or pending for retry.
+
+    Terminal jobs (completed, failed, cancelled) are never transitioned back to
+    pending or running.
+    """
     job = _JOBS.get(job_id)
-    if not job:
+    if not job or job.get("status") in TERMINAL_JOB_STATUSES:
         return
+    _close_attempt(job, ATTEMPT_FAILED if is_fatal else ATTEMPT_RELEASED, reason)
     job["error"] = sanitize_job_error(error)
     job["failed_at"] = datetime.now(timezone.utc).isoformat()
     if is_fatal:
         job["status"] = "failed"
     else:
+        job["retry_count"] = int(job.get("retry_count", 0)) + 1
         job["status"] = "pending"
         job.pop("worker_id", None)
+        job.pop("_stage_revision", None)
+        job.pop("_progress_at", None)
 
 
 def get_job_queue_metrics() -> dict[str, Any]:
@@ -1991,3 +2021,57 @@ def save_indexer_cursor(
                 (indexer_id, cursor, ledger),
             )
         connection.commit()
+
+
+def get_indexer_checkpoint_manifest(
+    indexer_id: str = "soroban_events",
+) -> dict[str, Any] | None:
+    """Return the stored checkpoint manifest dict for an indexer, if any."""
+    if not database_url():
+        state = _INDEXER_STATE.get(indexer_id)
+        if not state:
+            return None
+        manifest = state.get("manifest")
+        return dict(manifest) if isinstance(manifest, dict) else None
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "select cursor, ledger from indexer_state where id = %s;",
+                (indexer_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            raw_cursor = row.get("cursor")
+            if isinstance(raw_cursor, str) and raw_cursor.startswith("{"):
+                try:
+                    parsed = json.loads(raw_cursor)
+                    if isinstance(parsed, dict) and "manifest_hash" in parsed:
+                        return parsed
+                except Exception:
+                    return None
+            return None
+
+
+def save_indexer_checkpoint_manifest(
+    manifest: dict[str, Any],
+    indexer_id: str = "soroban_events",
+) -> None:
+    """Persist the verified checkpoint manifest alongside the indexer cursor."""
+    cursor_val = str(manifest.get("cursor") or "")
+    ledger_val = manifest.get("observed_ledger")
+    if not database_url():
+        _INDEXER_STATE[indexer_id] = {
+            "cursor": cursor_val,
+            "ledger": ledger_val,
+            "manifest": dict(manifest),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        return
+
+    save_indexer_cursor(
+        indexer_id=indexer_id,
+        cursor=cursor_val,
+        ledger=ledger_val if isinstance(ledger_val, int) else None,
+    )
